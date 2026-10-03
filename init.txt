@@ -1,0 +1,230 @@
+uint8 mt9v03x_init (void)
+{
+    uint8_t id_data = 0;
+    uint8_t debug_buf[100];
+    soft_iic_info_struct mt9v03x_iic_struct;
+    uint8_t buf[128];
+
+
+
+
+        // 1. 【必须最先做】硬件引脚属性配置
+       // mt9v03x_pin_config();
+
+        // 2. 【必须在扫描前】初始化结构体，告诉程序 SDA/SCL 到底是哪个脚
+        soft_iic_init(&mt9v03x_iic_struct, 0x5c, MT9V03X_COF_IIC_DELAY, MT9V03X_COF_IIC_SCL, MT9V03X_COF_IIC_SDA);
+
+        // 3. 强力复位总线
+        i2c_bus_release();
+        i2c_logic_check();
+
+        // 4. 开始扫描
+        /***debug_write_buffer("\r\n--- I2C Scanning... ---\r\n", 25);
+        int found = 0;
+       for (uint8_t addr = 0x01; addr < 0x80; addr++) {
+            soft_iic_start(&mt9v03x_iic_struct);
+
+            // 【关键逻辑判定修正】
+            // 既然你之前的 log 显示地址全通，是因为你的库里 ACK(0) 返回了 1，NACK(1) 返回了 0。
+            // 如果你还没改库代码，这里必须判断 == 1 才是真正的设备响应！
+            uint8_t ret = soft_iic_send_data(&mt9v03x_iic_struct, (uint8_t)(addr << 1));
+
+            if (ret == 1) { // 修改这里：匹配你库里那个“反人类”的 return 逻辑
+                zf_sprintf((char *)buf, ">>> [REAL DEVICE] Found at: 0x%X\r\n", addr);
+                debug_write_buffer(buf, strlen((char *)buf));
+                found++;
+            }
+            soft_iic_stop(&mt9v03x_iic_struct);
+        }
+
+        if(found == 0) {
+            debug_write_buffer("!!! FAILED: No Response.\r\n", 27);
+            return 1;
+        }
+        ***/
+    // 2. 硬件握手：读取模块 ID
+    // 逐飞模块的 ID 寄存器地址是 0xEF，读回来通常是模块版本号或固定 ID
+        uint16_t chip_id = soft_iic_read_16bit_register(&mt9v03x_iic_struct, 0x00);
+
+            if(chip_id == 0x0000 || chip_id == 0xFFFF) {
+                // 如果 16 位失败，再尝试 8 位读 0xEF (逐飞包装后的 ID)
+                id_data = soft_iic_read_8bit_register(&mt9v03x_iic_struct, 0xEF);
+            } else {
+                id_data = (uint8_t)(chip_id & 0xFF); // 只要不是 0 或 255 就说明通了
+            }
+    // ==========================================
+
+    if(id_data == 0x00 || id_data == 0xFF) // 如果读到全 0 或全 1，说明 IIC 没通
+    {
+        zf_sprintf((char *)debug_buf, "[MT9V03X] ERROR: No Module Found! ID:%d\r\n", id_data);
+        debug_write_buffer(debug_buf, (uint32_t)strlen((char *)debug_buf));
+        return 1;
+    }
+    zf_sprintf((char *)debug_buf, "[MT9V03X] Found Module ID: 0x%X\r\n", id_data);
+    debug_write_buffer(debug_buf, (uint32_t)strlen((char *)debug_buf));
+
+    // 3. 写入配置序列
+    // 确保你的 mt9v03x_set_config_sccb 内部已经改成了 8 位写入模式
+    debug_write_buffer((const uint8 *)"[MT9V03X] 2. Writing Config Array...\r\n", 37);
+    if(mt9v03x_set_config_sccb(&mt9v03x_iic_struct, mt9v03x_set_confing_buffer))
+    {
+        debug_write_buffer((const uint8 *)"[MT9V03X] ERROR: Config Write Failed!\r\n", 39);
+        return 1;
+    }
+    
+    uint8_t temp_data[2] = {0, 0};
+
+    // 2. 调用你头文件里板上钉钉有的函数
+    // 参数说明：IIC结构体，寄存器地址0x07，接收数组，读取长度2
+    soft_iic_read_8bit_registers(&mt9v03x_iic_struct, 0x07, temp_data, 2);
+
+    // 3. 把两个 8 位合成一个 16 位
+    // temp_data[0] 是高 8 位，temp_data[1] 是低 8 位
+    uint16_t real_reg07 = (uint16_t)((temp_data[0] << 8) | temp_data[1]);
+
+    // 4. 打印出来（这次用 %X 肯定没毛病）
+    zf_sprintf((int8 *)debug_buf, (const int8 *)"\r\n[REAL_DATA] Reg 0x07: 0x%X\r\n", real_reg07);
+    debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+    uint8_t dim_temp[2];
+    soft_iic_read_8bit_registers(&mt9v03x_iic_struct, 0x04, dim_temp, 2);
+    uint16_t cam_w = (uint16_t)((dim_temp[0] << 8) | dim_temp[1]);
+
+    // 2. 读 0x03 寄存器 (摄像头当前输出的高度)
+    soft_iic_read_8bit_registers(&mt9v03x_iic_struct, 0x03, dim_temp, 2);
+    uint16_t cam_h = (uint16_t)((dim_temp[0] << 8) | dim_temp[1]);
+
+    zf_sprintf((int8 *)debug_buf, (const int8 *)"\r\n[CAMSIG] Width: %d, Height: %d\r\n", cam_w, cam_h);
+    debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+
+    // 1. 设置宽度 (0x04) 为 184 -> 0x00B8
+    uint8_t write_buf[2];
+
+    // 1. 强行写宽度：184 (0x00B8)
+    write_buf[0] = 0x00; // 高位
+    write_buf[1] = 0xB8; // 低位
+    soft_iic_write_8bit_registers(&mt9v03x_iic_struct, 0x04, write_buf, 2);
+    system_delay_ms(5);
+
+    // 2. 强行写高度：120 (0x0078)
+    write_buf[0] = 0x00;
+    write_buf[1] = 0x78;
+    soft_iic_write_8bit_registers(&mt9v03x_iic_struct, 0x03, write_buf, 2);
+    system_delay_ms(5);
+
+    // 3. 再次强行确认极性：0x0188
+    write_buf[0] = 0x01;
+    write_buf[1] = 0x8B;
+    soft_iic_write_8bit_registers(&mt9v03x_iic_struct, 0x07, write_buf, 2);
+    system_delay_ms(5);
+    uint8_t read_back[2] = {0};
+        soft_iic_read_8bit_registers(&mt9v03x_iic_struct, 0x07, read_back, 2);
+        uint16_t actual_reg07 = (read_back[0] << 8) | read_back[1];
+
+        zf_sprintf((int8 *)debug_buf, "\r\n[TRUE_DATA] Reg 0x07 is really: 0x%X\r\n", actual_reg07);
+        debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+
+    // --- 这一步不能少！同步修改单片机的接收窗口 ---
+
+   /*** g_ceu_mt9v03x.p_api->open(g_ceu_mt9v03x.p_ctrl, g_ceu_mt9v03x.p_cfg);
+    // ==========================================
+    // 第二步：强行修改单片机 CEU 寄存器 (硬核对齐)
+    // ==========================================
+    // CAPWR 寄存器：高 16 位是捕获高度，低 16 位是捕获宽度
+    // 1. 先彻底关掉 CEU 状态机，否则 CAPWR 可能写不进去
+    R_CEU->CAPSR = 0;
+    system_delay_ms(1);
+
+    // 【接收大门】设置 184x120 接收窗口
+        R_CEU->CAPWR = 0x007800B8;
+
+        // 【裁剪剪刀】垂直保留 120，水平保留 184/2=92
+        // RA8D1手册铁律：Data Fetch 模式下，水平裁剪必须除以 2！
+        // 0x78 是 120，0x5C 是 92
+        R_CEU->CFSZR = 0x0078005C;
+
+        // 【内存搬运】DMA 行跨度 (以 4 字节为单位！)
+        // 184 个字节 ÷ 4 = 46
+        R_CEU->CDWDR = 184U;
+
+        // 【严格校验】关闭 FSP 惹祸的周期长度校验，允许波形微小波动
+        R_CEU->CMCYR = 0;
+
+    // 5. 重新开启捕获
+    R_CEU->CAPSR = 1;
+    // 4. 再次打印确认，这次一定要看到 0x007800B8！
+    uint32_t current_capwr = R_CEU->CAPWR;
+    zf_sprintf((int8 *)debug_buf, "\r\n[CRITICAL] Forced\n CAPWR: 0x%X\r\n", current_capwr);
+    debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+    zf_sprintf((int8 *)debug_buf, "\r\n[VERIFY] CDWDR: 0x%X\r\n", R_CEU->CDWDR);
+        debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+
+    zf_sprintf((int8 *)debug_buf, "\r\n[VERIFY] CFSZR: 0x%X\r\n", R_CEU->CFSZR);
+                debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+
+    zf_sprintf((int8 *)debug_buf, "\r\n[VERIFY] CMCYR: 0x%X\r\n", R_CEU->CMCYR);
+    debug_write_buffer(debug_buf, strlen((char *)debug_buf));***/
+    // 1. 让 FSP 把电源和时钟打开，然后我们接管
+        g_ceu_mt9v03x.p_api->open(g_ceu_mt9v03x.p_ctrl, g_ceu_mt9v03x.p_cfg);
+
+        // 2. 拔掉硬件引擎的电源，解除所有写保护
+        R_CEU->CAPSR = (1U << 16);
+        while(R_CEU->CAPSR & (1U << 16));
+        R_CEU->CAPSR = 0;
+        // ====================================================
+        // 3. 上帝模式：重写整条流水线 (逐字对齐，绝对正确)
+        // ====================================================
+
+        // 【核心模式】第 4 位置 1 (0x10)，绝对纯正的 Data Fetch 模式！
+        //R_CEU->CAMCR = 0x00000010;
+        R_CEU->CAMCR = 0x00020010;
+
+        // 【单次抓取】绝对禁止连续采集，Data Fetch模式不支持！
+        //R_CEU->CAPCR = 0x00000000;
+
+        // 【关闭校验】禁止严格周期校验，容忍波形微小抖动
+        R_CEU->CMCYR = 0x00000000;
+
+        // 【接收窗口】宽 184，高 120
+        R_CEU->CAPWR = 0x00B80078;
+
+        // 【裁剪剪刀】垂直 120 (0x78)，水平必须是宽度的二分之一：92 (0x5C)
+        R_CEU->CFSZR = 0x0078005C;
+
+        // 【DMA 跨度】行字节数：184
+        R_CEU->CDWDR = 184U;
+
+        // 【数据输出】Data Fetch 模式下，CDOCR 的第 4 位 (CDS) 必须为 1！
+        R_CEU->CDOCR = 0x00000010;
+
+        // 【目标地址】强行指定为你那块 AXI SRAM 内存
+        R_CEU->CDAYR = (uint32_t)mt9v03x_image;
+
+        // 清除一切历史报错标志
+        *(uint32_t *)((uint32_t)R_CEU + 0x18) = 0;
+
+        // 4. 打印验明正身
+        zf_sprintf((int8 *)debug_buf, "\r\n[GOD MODE] CAMCR: 0x%X, CDOCR: 0x%X\r\n", R_CEU->CAMCR, R_CEU->CDOCR);
+        debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+        // 5. 打印状态看一眼
+
+        // 5. 重新开门，迎接数据！
+        R_CEU->CAPSR = 1;
+        zf_sprintf((int8 *)debug_buf, "\r\n[RACE START] SR: 0x%X, ADDR: 0x%X\r\n", R_CEU->CAPSR, R_CEU->CDAYR);
+        debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+    // ==========================================
+    // 第三步：回读验证 (确保真的写进去了)
+    // ==========================================
+   /*** uint8_t verify_temp[2];
+    soft_iic_read_8bit_registers(&mt9v03x_iic_struct, 0x04, verify_temp, 2);
+    uint16_t final_w = (uint16_t)((verify_temp[0] << 8) | verify_temp[1]);
+
+    zf_sprintf((int8 *)debug_buf, (const int8 *)"\r\n[LAST_CHECK] Width: %d (Target: 184)\r\n", final_w);
+    debug_write_buffer(debug_buf, strlen((char *)debug_buf));
+    ***/
+    // 4. 打开驱动并捕获
+
+    g_ceu_mt9v03x.p_api->captureStart(g_ceu_mt9v03x.p_ctrl, (uint8*)mt9v03x_image);
+
+    R_CEU->CAPCR = R_CEU_CAPCR_CTNCP_Msk;
+    return 0;
+}
